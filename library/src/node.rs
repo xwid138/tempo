@@ -1,13 +1,8 @@
-use std::sync::Arc;
-
-use alloy_eips::eip7685::Requests;
-use alloy_primitives::U256;
-
 use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 
-use crate::block::MalachiteBlock;
 use crate::consensus::MalachiteConsensusBuilder;
+use crate::state::State;
 
 use reth::payload::{PayloadBuilderHandle, PayloadServiceCommand};
 use reth::transaction_pool::TransactionPool;
@@ -22,13 +17,16 @@ use reth_primitives::{Block as RethBlock, SealedBlock};
 use reth_trie_db::MerklePatriciaTrie;
 
 /// Type configuration for a regular Malachite node.
-#[derive(Debug, Clone, Default)]
-pub struct MalachiteNode;
+#[derive(Debug, Clone)]
+pub struct MalachiteNode{
+    // Consensus state
+    pub state: State,
+}
 
 impl MalachiteNode {
     /// Create a new MalachiteNode
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(state: State) -> Self {
+        Self { state }
     }
 }
 
@@ -113,4 +111,3 @@ where
         EthereumAddOns::default()
     }
 }
-

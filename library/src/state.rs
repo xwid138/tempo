@@ -17,6 +17,7 @@ use crate::utils::seed_from_address;
 
 /// Represents the internal state of the application node
 /// Contains information about current height, round, proposals and blocks
+#[derive(Debug, Clone)]
 pub struct State {
     pub ctx: MalachiteContext,
     pub config: Config,
@@ -29,13 +30,12 @@ pub struct State {
     pub peers: HashSet<PeerId>,
     pub store: Store,
 
-    signing_provider: Ed25519Provider,
-    streams_map: PartStreamsMap,
-    rng: StdRng,
-
+    pub signing_provider: Ed25519Provider,
+    pub streams_map: PartStreamsMap,
+    pub rng: StdRng,
 
     // Handle to the payload builder service
-    engine_handle: PayloadBuilderHandle<EthPayloadTypes>,
+    pub engine_handle: PayloadBuilderHandle<EthPayloadTypes>,
 }
 
 impl State {
@@ -222,6 +222,7 @@ impl fmt::Debug for PeerId {
 }
 
 // Use reth store implementation
+#[derive(Debug, Clone)]
 pub struct Store {
     // This would typically interface with reth's storage layer
     // For now, we'll use a simple in-memory store
@@ -258,6 +259,7 @@ impl Default for Store {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct PartStreamsMap {
     // Maps from peer ID to their partial stream state
     streams: HashMap<PeerId, PartialStreamState>,
