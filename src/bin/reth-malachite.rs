@@ -14,6 +14,7 @@
 
 use clap::Parser;
 use reth::builder::NodeHandle;
+use reth_chainspec::EthChainSpec;
 use reth_malachite::{
     app::{node::RethNode, Config, Genesis, State, ValidatorInfo},
     cli::{Cli, MalachiteArgs, MalachiteChainSpecParser},
@@ -41,7 +42,7 @@ fn main() -> eyre::Result<()> {
             };
 
             // Load genesis from file if provided, otherwise use default
-            let genesis = if args.genesis.is_some() && args.genesis_file().exists() {
+            let mut genesis = if args.genesis.is_some() && args.genesis_file().exists() {
                 tracing::info!("Loading genesis from: {:?}", args.genesis_file());
                 reth_malachite::app::config_loader::load_genesis(&args.genesis_file())?
             } else {
@@ -97,6 +98,12 @@ fn main() -> eyre::Result<()> {
 
             // Get the provider from the node
             let provider = node.provider.clone();
+
+            // Get the chain spec to extract genesis hash
+            let chain_spec = node.chain_spec();
+
+            // Update genesis with the actual genesis hash from chain spec
+            genesis.genesis_hash = chain_spec.genesis_hash();
 
             // Create the signing provider if we have a validator key
             let signing_provider = if let Some(privkey) = validator_privkey {
