@@ -364,13 +364,32 @@ impl State {
         height: Height,
         round: Round,
     ) -> Result<LocallyProposedValue<MalachiteContext>> {
-        // 1. Create payload attributes for the block at this height
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        // 1. Get parent block timestamp for monotonic increasing timestamps
+        let (parent_hash, parent_timestamp) = if height.as_u64() == 1 {
+            // For genesis, use current time
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            (self.genesis.genesis_hash, timestamp)
+        } else {
+            // For other blocks, get parent block and use parent.timestamp + 1
+            let parent_height = Height(height.as_u64() - 1);
+            let parent = self
+                .get_decided_value(parent_height)
+                .await
+                .ok_or_else(|| eyre::eyre!("Parent block not found at height {}", parent_height))?;
 
-        let parent_hash = self.get_parent_hash(height).await?;
+            let parent_block = &parent.value.block;
+            let parent_hash = parent_block.header.hash_slow();
+            let parent_timestamp = parent_block.header.timestamp;
 
+            (parent_hash, parent_timestamp)
+        };
+
+        // Use parent_timestamp + 1 to ensure monotonic increasing timestamps
+        let timestamp = parent_timestamp + 1;
+
+        // 2. Create payload attributes for the block at this height
         let payload_attrs = alloy_rpc_types_engine::PayloadAttributes {
             timestamp,
             prev_randao: B256::ZERO, // For PoS compatibility
@@ -379,7 +398,7 @@ impl State {
             parent_beacon_block_root: Some(B256::ZERO),
         };
 
-        // 2. Send FCU to trigger payload building
+        // 3. Send FCU to trigger payload building
         let forkchoice_state = ForkchoiceState {
             head_block_hash: parent_hash,
             safe_block_hash: parent_hash,
@@ -395,12 +414,12 @@ impl State {
             )
             .await?;
 
-        // 3. Get the payload ID from the response
+        // 4. Get the payload ID from the response
         let payload_id = fcu_response
             .payload_id
             .ok_or_else(|| eyre::eyre!("No payload ID returned from FCU"))?;
 
-        // 4. Get the built payload - use WaitForPending to wait for at least one built payload
+        // 5. Get the built payload - use WaitForPending to wait for at least one built payload
         // This will wait for the payload builder to produce a payload with transactions
         // It won't return an empty payload immediately like Earliest would
         let payload = self
@@ -875,20 +894,6 @@ impl State {
             .await
     }
 
-    /// Get the parent hash for a given height
-    async fn get_parent_hash(&self, height: Height) -> Result<B256> {
-        if height.as_u64() == 1 {
-            return Ok(self.genesis.genesis_hash);
-        }
-
-        let parent_height = Height(height.as_u64() - 1);
-        let parent = self
-            .get_decided_value(parent_height)
-            .await
-            .ok_or_else(|| eyre::eyre!("Parent block not found at height {}", parent_height))?;
-
-        Ok(parent.value.block.header.hash_slow())
-    }
 
     /// Get the finalized block hash
     /// In Malachite, blocks have instant finality - once committed, they're immediately finalized
