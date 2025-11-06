@@ -56,10 +56,10 @@ impl<'a, S: PrecompileStorageProvider> Precompile for StablecoinExchange<'a, S> 
                 })
             }
 
-            IStablecoinExchange::getPriceLevelCall::SELECTOR => {
-                view::<IStablecoinExchange::getPriceLevelCall>(calldata, |call| {
-                    self.get_price_level(call.base, call.tick, call.isBid)
-                        .map(Into::into)
+            IStablecoinExchange::getTickLevelCall::SELECTOR => {
+                view::<IStablecoinExchange::getTickLevelCall>(calldata, |call| {
+                    let level = self.get_price_level(call.base, call.tick, call.isBid)?;
+                    Ok((level.head, level.tail, level.total_liquidity).into())
                 })
             }
 
