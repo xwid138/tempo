@@ -10,6 +10,8 @@ use itertools::Itertools;
 use metrics::{counter, describe_counter};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use poem::{EndpointExt as _, Route, Server, get, listener::TcpListener};
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashSet, time::Duration};
 use tempo_precompiles::{
     TIP_FEE_MANAGER_ADDRESS, TIP20_FACTORY_ADDRESS, tip_fee_manager::ITIPFeeAMM,
@@ -19,6 +21,9 @@ use tempo_telemetry_util::error_field;
 use tracing::{debug, error, info, instrument};
 
 use crate::monitor;
+
+/// Duration in seconds to mute a token after an InsufficientBalance error
+const TOKEN_MUTE_DURATION_SECS: u64 = 300; // 5 minutes
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -146,11 +151,33 @@ impl SimpleArbArgs {
             }
         }
 
+        // if there was insufficient balance for a token it's added to muted map so rebalances will be skipped until stored timestamp
+        let mut muted: HashMap<Address, u64> = HashMap::new();
+
         // NOTE: currently this is a very simple approach that checks all pools every `n`
         // milliseconds. While this should ensure pools are always balanced within a few blocks,
         // this can be updated to listen to events and only rebalance pools that have been swapped.
         loop {
+            // Clean up expired muted entries
+            let current_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            muted.retain(|_, &mut unmute_time| unmute_time > current_time);
+
             for pair in pairs.iter() {
+                // Check if token is muted
+                if let Some(&unmute_time) = muted.get(&pair.1) {
+                    if unmute_time > current_time {
+                        debug!(
+                            token = %pair.1,
+                            unmute_time = unmute_time,
+                            "Skipping muted token"
+                        );
+                        continue;
+                    }
+                }
+
                 // Get current pool state
                 let pool = fee_amm
                     .getPool(pair.0, pair.1)
@@ -178,6 +205,8 @@ impl SimpleArbArgs {
                         }
 
                         Err(e) => {
+                            let error_msg = format!("{:?}", e);
+
                             error!(
                                 token_a = %pair.0,
                                 token_b = %pair.1,
@@ -188,6 +217,23 @@ impl SimpleArbArgs {
 
                             counter!("tempo_arb_bot_failed_transactions", "error" => "tx_send")
                                 .increment(1);
+
+                            // If this is an InsufficientBalance error, add token to muted list
+                            if error_msg.contains("InsufficientBalance") {
+                                let unmute_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                                    + TOKEN_MUTE_DURATION_SECS;
+
+                                muted.insert(pair.1, unmute_time);
+
+                                info!(
+                                    token = %pair.1,
+                                    unmute_time = unmute_time,
+                                    "Token muted due to InsufficientBalance error"
+                                );
+                            }
                         }
                     }
 
