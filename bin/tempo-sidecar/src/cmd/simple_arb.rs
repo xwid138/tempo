@@ -131,6 +131,9 @@ async fn continue_rebalancing<P: Provider>(
     // milliseconds. While this should ensure pools are always balanced within a few blocks,
     // this can be updated to listen to events and only rebalance pools that have been swapped.
     loop {
+        let mut pools_to_rebalance = 0;
+        let mut errors = 0;
+
         // Clean up expired muted entries
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -164,6 +167,7 @@ async fn continue_rebalancing<P: Provider>(
                 })?;
 
             if pool.reserveUserToken > 0 {
+                pools_to_rebalance += 1;
                 let mut pending_txs = vec![];
 
                 match fee_amm
@@ -181,6 +185,7 @@ async fn continue_rebalancing<P: Provider>(
                     }
 
                     Err(e) => {
+                        errors += 1;
                         let error_msg = format!("{:?}", e);
 
                         error!(
@@ -239,6 +244,10 @@ async fn continue_rebalancing<P: Provider>(
                 }
             }
         }
+        debug!(
+            "Found {} pools to rebalance, failed times: {}",
+            pools_to_rebalance, errors
+        );
 
         tokio::time::sleep(Duration::from_secs(poll_interval)).await;
         debug!("Polling interval elapsed, checking pools for rebalancing");
@@ -297,6 +306,7 @@ impl SimpleArbArgs {
 
         info!("Rebalancing initial pools...");
         initial_rebalance(&fee_amm, &pairs, &signer_address).await?;
+        info!("Starting to rebalance pools periodically");
         continue_rebalancing(&fee_amm, &pairs, &signer_address, self.poll_interval).await?;
         Ok(())
     }
