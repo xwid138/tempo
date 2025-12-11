@@ -22,6 +22,12 @@ use tracing::{debug, error, info, instrument};
 
 use crate::monitor;
 
+#[derive(PartialEq, Eq, Hash)]
+struct Pair {
+    pub token_a: Address,
+    pub token_b: Address,
+}
+
 /// Duration in seconds to mute a token after an InsufficientBalance error
 const TOKEN_MUTE_DURATION_SECS: u64 = 300; // 5 minutes
 
@@ -46,7 +52,7 @@ pub struct SimpleArbArgs {
 }
 
 #[instrument(skip(provider))]
-async fn fetch_all_pairs<P: Provider>(provider: P) -> eyre::Result<HashSet<(Address, Address)>> {
+async fn fetch_all_pairs<P: Provider>(provider: P) -> eyre::Result<HashSet<Pair>> {
     let tip20_factory = ITIP20Factory::new(TIP20_FACTORY_ADDRESS, provider);
     let last_token_id = tip20_factory.tokenIdCounter().call().await?.to::<u64>();
 
@@ -57,7 +63,7 @@ async fn fetch_all_pairs<P: Provider>(provider: P) -> eyre::Result<HashSet<(Addr
     let mut pairs = HashSet::new();
     for pair in tokens.iter().permutations(2) {
         let (token_a, token_b) = (*pair[0], *pair[1]);
-        pairs.insert((token_a, token_b));
+        pairs.insert(Pair { token_a, token_b });
     }
 
     info!(
@@ -68,6 +74,10 @@ async fn fetch_all_pairs<P: Provider>(provider: P) -> eyre::Result<HashSet<(Addr
 
     Ok(pairs)
 }
+
+// funciton initial_rebalance() {
+
+// }
 
 impl SimpleArbArgs {
     pub async fn run(self) -> eyre::Result<()> {
@@ -123,18 +133,21 @@ impl SimpleArbArgs {
         for pair in pairs.iter() {
             // Get current pool state
             let pool = fee_amm
-                .getPool(pair.0, pair.1)
+                .getPool(pair.token_a, pair.token_b)
                 .call()
                 .await
                 .wrap_err_with(|| {
-                    format!("failed to fetch pool for tokens {}, {}", pair.0, pair.1)
+                    format!(
+                        "failed to fetch pool for tokens {}, {}",
+                        pair.token_a, pair.token_b
+                    )
                 })?;
 
             if pool.reserveUserToken > 0
                 && let Err(e) = fee_amm
                     .rebalanceSwap(
-                        pair.0,
-                        pair.1,
+                        pair.token_a,
+                        pair.token_b,
                         U256::from(pool.reserveUserToken),
                         signer_address,
                     )
@@ -142,8 +155,8 @@ impl SimpleArbArgs {
                     .await
             {
                 error!(
-                    token_a = %pair.0,
-                    token_b = %pair.1,
+                    token_a = %pair.token_a,
+                    token_b = %pair.token_b,
                     amount = %pool.reserveUserToken,
                     err = error_field(&e),
                     "Failed to send initial rebalance transaction"
@@ -167,10 +180,10 @@ impl SimpleArbArgs {
 
             for pair in pairs.iter() {
                 // Check if token is muted
-                if let Some(&unmute_time) = muted.get(&pair.1) {
+                if let Some(&unmute_time) = muted.get(&pair.token_b) {
                     if unmute_time > current_time {
                         debug!(
-                            token = %pair.1,
+                            token = %pair.token_b,
                             unmute_time = unmute_time,
                             "Skipping muted token"
                         );
@@ -180,11 +193,14 @@ impl SimpleArbArgs {
 
                 // Get current pool state
                 let pool = fee_amm
-                    .getPool(pair.0, pair.1)
+                    .getPool(pair.token_a, pair.token_b)
                     .call()
                     .await
                     .wrap_err_with(|| {
-                        format!("failed to fetch pool for tokens {:?}, {:?}", pair.0, pair.1)
+                        format!(
+                            "failed to fetch pool for tokens {:?}, {:?}",
+                            pair.token_a, pair.token_b
+                        )
                     })?;
 
                 if pool.reserveUserToken > 0 {
@@ -192,8 +208,8 @@ impl SimpleArbArgs {
 
                     match fee_amm
                         .rebalanceSwap(
-                            pair.0,
-                            pair.1,
+                            pair.token_a,
+                            pair.token_b,
                             U256::from(pool.reserveUserToken),
                             signer_address,
                         )
@@ -208,8 +224,8 @@ impl SimpleArbArgs {
                             let error_msg = format!("{:?}", e);
 
                             error!(
-                                token_a = %pair.0,
-                                token_b = %pair.1,
+                                token_a = %pair.token_a,
+                                token_b = %pair.token_b,
                                 amount = %pool.reserveUserToken,
                                 err = error_field(&e),
                                 "Failed to send rebalance transaction"
@@ -226,10 +242,10 @@ impl SimpleArbArgs {
                                     .as_secs()
                                     + TOKEN_MUTE_DURATION_SECS;
 
-                                muted.insert(pair.1, unmute_time);
+                                muted.insert(pair.token_b, unmute_time);
 
                                 info!(
-                                    token = %pair.1,
+                                    token = %pair.token_b,
                                     unmute_time = unmute_time,
                                     "Token muted due to InsufficientBalance error"
                                 );
