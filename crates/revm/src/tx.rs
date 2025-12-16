@@ -2,6 +2,7 @@ use crate::TempoInvalidTransaction;
 use alloy_consensus::{EthereumTxEnvelope, TxEip4844, Typed2718, crypto::secp256k1};
 use alloy_evm::{FromRecoveredTx, FromTxWithEncoded, IntoTxEnv};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_sol_types::SolCall;
 use reth_evm::TransactionEnv;
 use revm::context::{
     Transaction, TxEnv,
@@ -11,10 +12,13 @@ use revm::context::{
         AccessList, AccessListItem, RecoveredAuthority, RecoveredAuthorization, SignedAuthorization,
     },
 };
+use tempo_contracts::precompiles::ITIP20;
+use tempo_precompiles::{nonce::NonceManager, tip20::TIP20Token};
 use tempo_primitives::{
     AASigned, TempoSignature, TempoTransaction, TempoTxEnvelope, TxFeeToken,
     transaction::{
         Call, RecoveredTempoAuthorization, SignedKeyAuthorization, calc_gas_balance_spending,
+        envelope::TIP20_PAYMENT_PREFIX,
     },
 };
 
@@ -51,6 +55,7 @@ pub struct TempoBatchCallEnv {
     /// Transaction signature hash (for signature verification)
     pub signature_hash: B256,
 }
+
 /// Tempo transaction environment.
 #[derive(Debug, Clone, Default, derive_more::Deref, derive_more::DerefMut)]
 pub struct TempoTxEnv {
@@ -74,6 +79,9 @@ pub struct TempoTxEnv {
 
     /// AA-specific transaction environment (boxed to keep TempoTxEnv lean for non-AA tx)
     pub tempo_tx_env: Option<Box<TempoBatchCallEnv>>,
+
+    /// Storage slots this tx may access (None if not computed)
+    pub storage_slots: Option<StorageSlots>,
 }
 
 impl TempoTxEnv {
@@ -119,6 +127,38 @@ impl TempoTxEnv {
                 self.inner.input().as_ref(),
             )))
         }
+    }
+
+    /// Returns the storage slot for the 2D nonce key, if available.
+    pub fn nonce_key_slot(&self) -> Option<U256> {
+        self.storage_slots.as_ref()?.nonce_key
+    }
+
+    /// Returns the storage slot for the sender's fee token balance, if available.
+    pub fn fee_token_balance_slot(&self) -> Option<U256> {
+        self.storage_slots.as_ref()?.fee_token_balance
+    }
+
+    /// Returns the storage slots for TIP-20 transfer senders' balances.
+    ///
+    /// - `None` means not computed (e.g., non-AA transaction, RPC compat)
+    /// - `Some(&[])` means computed but no TIP-20 transfers found
+    /// - `Some(&[slot1, slot2, ...])` means N TIP-20 transfers found with their balance slots
+    pub fn tip20_from_balance_slots(&self) -> Option<&[U256]> {
+        self.storage_slots
+            .as_ref()
+            .map(|s| s.tip20_from_balances.as_slice())
+    }
+
+    /// Returns the storage slots for TIP-20 transfer recipients' balances.
+    ///
+    /// - `None` means not computed (e.g., non-AA transaction, RPC compat)
+    /// - `Some(&[])` means computed but no TIP-20 transfers found
+    /// - `Some(&[slot1, slot2, ...])` means N TIP-20 transfers found with their balance slots
+    pub fn tip20_to_balance_slots(&self) -> Option<&[U256]> {
+        self.storage_slots
+            .as_ref()
+            .map(|s| s.tip20_to_balances.as_slice())
     }
 }
 
@@ -299,8 +339,25 @@ impl FromRecoveredTx<TxFeeToken> for TempoTxEnv {
                     .ok()
             }),
             tempo_tx_env: None, // Non-AA transaction
+            storage_slots: None,
         }
     }
+}
+
+/// Storage slots that a transaction may access.
+///
+/// This is populated during transaction-to-environment conversion and used for
+/// optimization in both validation and payload building.
+#[derive(Debug, Clone, Default)]
+pub struct StorageSlots {
+    /// Storage slot of the 2D nonce (None if tx has no nonce key).
+    pub nonce_key: Option<U256>,
+    /// Storage slot for sender's fee token balance (None if tx has no fee token).
+    pub fee_token_balance: Option<U256>,
+    /// Storage slots for TIP-20 transfer senders' balances (empty if no TIP-20 transfers).
+    pub tip20_from_balances: Vec<U256>,
+    /// Storage slots for TIP-20 transfer recipients' balances (empty if no TIP-20 transfers).
+    pub tip20_to_balances: Vec<U256>,
 }
 
 impl FromRecoveredTx<AASigned> for TempoTxEnv {
@@ -313,6 +370,28 @@ impl FromRecoveredTx<AASigned> for TempoTxEnv {
         if let Some(keychain_sig) = signature.as_keychain() {
             let _ = keychain_sig.key_id(&aa_signed.signature_hash());
         }
+        let nonce_key = tx.nonce_key;
+        let sender = caller;
+        let slot = NonceManager::new().nonces.at(sender).at(nonce_key).slot();
+
+        let fee_token_balance_slot = tx.fee_token.map(|fee_token_address| {
+            TIP20Token::from_address(fee_token_address)
+                .unwrap()
+                .balances
+                .at(sender)
+                .slot()
+        });
+
+        // Extract TIP-20 balance slots from all calls
+        let (tip20_from_balances, tip20_to_balances) =
+            extract_tip20_balance_slots(&tx.calls, sender);
+
+        let storage_slots = Some(StorageSlots {
+            nonce_key: Some(slot),
+            fee_token_balance: fee_token_balance_slot,
+            tip20_from_balances,
+            tip20_to_balances,
+        });
 
         let TempoTransaction {
             chain_id,
@@ -392,6 +471,7 @@ impl FromRecoveredTx<AASigned> for TempoTxEnv {
                 key_authorization: key_authorization.clone(),
                 signature_hash: aa_signed.signature_hash(),
             })),
+            storage_slots,
         }
     }
 }
@@ -405,6 +485,7 @@ impl FromRecoveredTx<TempoTxEnvelope> for TempoTxEnv {
                 is_system_tx: tx.is_system_tx(),
                 fee_payer: None,
                 tempo_tx_env: None, // Non-AA transaction
+                storage_slots: None,
             },
             TempoTxEnvelope::Eip2930(tx) => TxEnv::from_recovered_tx(tx.tx(), sender).into(),
             TempoTxEnvelope::Eip1559(tx) => TxEnv::from_recovered_tx(tx.tx(), sender).into(),
@@ -440,5 +521,175 @@ impl FromTxWithEncoded<AASigned> for TempoTxEnv {
 impl FromTxWithEncoded<TempoTxEnvelope> for TempoTxEnv {
     fn from_encoded_tx(tx: &TempoTxEnvelope, sender: Address, _encoded: Bytes) -> Self {
         Self::from_recovered_tx(tx, sender)
+    }
+}
+
+/// Extracts TIP-20 balance slots from all calls in an AA transaction.
+///
+/// Iterates through each call, identifies TIP-20 transfers, and computes the storage slots
+/// for both sender and recipient balances.
+///
+/// Returns a tuple of `(from_balance_slots, to_balance_slots)` for all TIP-20 transfers found.
+fn extract_tip20_balance_slots(calls: &[Call], sender: Address) -> (Vec<U256>, Vec<U256>) {
+    let mut tip20_from_balances = Vec::new();
+    let mut tip20_to_balances = Vec::new();
+
+    for call in calls {
+        // Check if this call is to a TIP-20 token
+        if let Some(to_addr) = call.to.to() {
+            if to_addr.starts_with(&TIP20_PAYMENT_PREFIX) {
+                // Try to decode transfer addresses from this call
+                if let Some((from_addr, to_addr_transfer)) =
+                    decode_transfer_addresses(&call.input, sender)
+                {
+                    // Cache the balance slots for this transfer
+                    if let Ok(token) = TIP20Token::from_address(*to_addr) {
+                        tip20_from_balances.push(token.balances.at(from_addr).slot());
+                        tip20_to_balances.push(token.balances.at(to_addr_transfer).slot());
+                    }
+                }
+            }
+        }
+    }
+
+    (tip20_from_balances, tip20_to_balances)
+}
+
+/// Decodes a TIP-20/ERC-20 transfer call and extracts sender and recipient addresses.
+///
+/// Returns `Some((from, to))` if the calldata is a valid transfer call, `None` otherwise.
+/// Supports: `transfer`, `transferWithMemo`, `transferFrom`, and `transferFromWithMemo`.
+///
+/// For `transfer()` calls, the sender is the transaction signer (`tx_sender` parameter).
+/// For `transferFrom()` calls, the sender is decoded from the calldata.
+fn decode_transfer_addresses(calldata: &Bytes, tx_sender: Address) -> Option<(Address, Address)> {
+    // Try transfer(address,uint256) - sender is tx_sender
+    if let Ok(call) = ITIP20::transferCall::abi_decode(calldata) {
+        return Some((tx_sender, call.to));
+    }
+
+    // Try transferWithMemo(address,uint256,bytes32) - sender is tx_sender
+    if let Ok(call) = ITIP20::transferWithMemoCall::abi_decode(calldata) {
+        return Some((tx_sender, call.to));
+    }
+
+    // Try transferFrom(address,address,uint256) - sender is in calldata
+    if let Ok(call) = ITIP20::transferFromCall::abi_decode(calldata) {
+        return Some((call.from, call.to));
+    }
+
+    // Try transferFromWithMemo(address,address,uint256,bytes32) - sender is in calldata
+    if let Ok(call) = ITIP20::transferFromWithMemoCall::abi_decode(calldata) {
+        return Some((call.from, call.to));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{U256, address};
+    use alloy_sol_types::SolCall;
+    use tempo_contracts::precompiles::ITIP20;
+    use tempo_precompiles::{
+        storage::{hashmap::HashMapStorageProvider, thread_local::StorageCtx},
+        tip20::token_id_to_address,
+    };
+
+    #[test]
+    fn test_extract_tip20_balance_slots() {
+        let mut storage = HashMapStorageProvider::new(1);
+        let tx_sender = address!("1111111111111111111111111111111111111111");
+        let recipient = address!("2222222222222222222222222222222222222222");
+        let from_addr = address!("3333333333333333333333333333333333333333");
+        let to_addr = address!("4444444444444444444444444444444444444444");
+
+        // Create a TIP-20 token address (token_id = 1)
+        let tip20_token = token_id_to_address(1);
+
+        // Create 4 calls with different transfer function types
+        let calls = vec![
+            // 1. transfer(address,uint256)
+            Call {
+                to: TxKind::Call(tip20_token),
+                value: U256::ZERO,
+                input: ITIP20::transferCall {
+                    to: recipient,
+                    amount: U256::from(1000),
+                }
+                .abi_encode()
+                .into(),
+            },
+            // 2. transferWithMemo(address,uint256,bytes32)
+            Call {
+                to: TxKind::Call(tip20_token),
+                value: U256::ZERO,
+                input: ITIP20::transferWithMemoCall {
+                    to: recipient,
+                    amount: U256::from(2000),
+                    memo: [0u8; 32].into(),
+                }
+                .abi_encode()
+                .into(),
+            },
+            // 3. transferFrom(address,address,uint256)
+            Call {
+                to: TxKind::Call(tip20_token),
+                value: U256::ZERO,
+                input: ITIP20::transferFromCall {
+                    from: from_addr,
+                    to: to_addr,
+                    amount: U256::from(3000),
+                }
+                .abi_encode()
+                .into(),
+            },
+            // 4. transferFromWithMemo(address,address,uint256,bytes32)
+            Call {
+                to: TxKind::Call(tip20_token),
+                value: U256::ZERO,
+                input: ITIP20::transferFromWithMemoCall {
+                    from: from_addr,
+                    to: to_addr,
+                    amount: U256::from(4000),
+                    memo: [1u8; 32].into(),
+                }
+                .abi_encode()
+                .into(),
+            },
+        ];
+
+        // Extract balance slots within StorageCtx
+        let result = StorageCtx::enter(&mut storage, || {
+            let (from_slots, to_slots) = extract_tip20_balance_slots(&calls, tx_sender);
+
+            // Verify we got 4 slots for each (one per transfer call)
+            assert_eq!(from_slots.len(), 4, "Should have 4 from_slots");
+            assert_eq!(to_slots.len(), 4, "Should have 4 to_slots");
+
+            // Verify the slots are for the correct addresses
+            let token = TIP20Token::from_address(tip20_token)?;
+
+            // Call 1: transfer (sender = tx_sender, recipient)
+            assert_eq!(from_slots[0], token.balances.at(tx_sender).slot());
+            assert_eq!(to_slots[0], token.balances.at(recipient).slot());
+
+            // Call 2: transferWithMemo (sender = tx_sender, recipient)
+            assert_eq!(from_slots[1], token.balances.at(tx_sender).slot());
+            assert_eq!(to_slots[1], token.balances.at(recipient).slot());
+
+            // Call 3: transferFrom (sender = from_addr, recipient = to_addr)
+            assert_eq!(from_slots[2], token.balances.at(from_addr).slot());
+            assert_eq!(to_slots[2], token.balances.at(to_addr).slot());
+
+            // Call 4: transferFromWithMemo (sender = from_addr, recipient = to_addr)
+            assert_eq!(from_slots[3], token.balances.at(from_addr).slot());
+            assert_eq!(to_slots[3], token.balances.at(to_addr).slot());
+
+            Ok::<_, tempo_precompiles::error::TempoPrecompileError>(())
+        });
+
+        assert!(result.is_ok(), "Test should complete successfully");
     }
 }

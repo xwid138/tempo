@@ -146,6 +146,7 @@ impl TryIntoTxEnv<TempoTxEnv, TempoBlockEnv> for TempoTransactionRequest {
                 None
             },
             inner: inner.try_into_tx_env(evm_env)?,
+            storage_slots: None,
         })
     }
 }
