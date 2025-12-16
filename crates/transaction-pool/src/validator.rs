@@ -361,6 +361,9 @@ where
                 propagate,
                 authorities,
             } => {
+                // Pre-compute TempoTxEnv early to enable access to storage slots
+                transaction.transaction().prepare_tx_env();
+
                 // Additional 2D nonce validations
                 // Check for 2D nonce validation (nonce_key > 0)
                 if let Some(nonce_key) = transaction.transaction().nonce_key()
@@ -401,9 +404,6 @@ where
                         );
                     }
                 }
-
-                // Pre-compute TempoTxEnv to avoid the cost during payload building.
-                transaction.transaction().prepare_tx_env();
 
                 TransactionValidationOutcome::Valid {
                     balance,
